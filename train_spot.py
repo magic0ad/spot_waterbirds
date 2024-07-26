@@ -326,9 +326,9 @@ def train(args):
             logger.log_metrics(global_step, {'VAL/mse': val_mse,
                                              'VAL/ari (slots)': ari_slot.item(),
                                              'VAL/ari (decoder)': ari.item(),
-                                             'VAL/mbo_c': mbo_c.item(),
-                                             'VAL/mbo_i': mbo_i.item(),
-                                             'VAL/miou': miou.item(),
+                                             'VAL/mbo_c (decoder)': mbo_c.item(),
+                                             'VAL/mbo_i (decoder)': mbo_i.item(),
+                                             'VAL/miou (decoder)': miou.item(),
                                              'VAL/mbo_c (slots)': mbo_c_slot.item(),
                                              'VAL/mbo_i (slots)': mbo_i_slot.item(),
                                              'VAL/miou (slots)': miou_slot.item()})
