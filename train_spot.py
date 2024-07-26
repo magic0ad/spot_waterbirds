@@ -1,10 +1,12 @@
 import math
 import copy
+import os
 import os.path
 import argparse
 from tqdm import tqdm
 from datetime import datetime
 
+import numpy as np
 import torch
 from torch.optim import Adam
 import torch.nn.functional as F
@@ -12,11 +14,19 @@ from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+
+try:
+    import wandb
+    WANDB_AVAIL = True
+except:
+    WANDB_AVAIL = False
 
 from spot import SPOT
 from datasets import PascalVOC, COCO2017, MOVi, Waterbird
 from ocl_metrics import UnsupervisedMaskIoUMetric, ARIMetric
 from utils_spot import inv_normalize, cosine_scheduler, visualize, bool_flag, load_pretrained_encoder
+from universal_logger.logger import UniversalLogger
 import models_vit
 
 
@@ -74,18 +84,30 @@ def get_args_parser():
     
     parser.add_argument('--train_permutations',  type=str, default='random', help='which permutation')
     parser.add_argument('--eval_permutations',  type=str, default='standard', help='which permutation')
+    # wandb
+    #parser.add_argument('--wandb_project_name', type=str, default=None, help='Name of the wandb project')
+    parser.add_argument('--use_wandb', action='store_true')
+    parser.add_argument('--tag', type=str, default="debug", help='wandb tag')
     
     return parser
 
 def train(args):
     torch.manual_seed(args.seed)
-    
-    arg_str_list = ['{}={}'.format(k, v) for k, v in vars(args).items()]
-    arg_str = '__'.join(arg_str_list)
-    log_dir = os.path.join(args.log_path, datetime.today().isoformat())
-    print('log_dir: ', log_dir)
-    writer = SummaryWriter(log_dir)
-    writer.add_text('hparams', arg_str)
+
+    # wandb
+    if WANDB_AVAIL and args.use_wandb:
+        wandb_exp = wandb.init(project="spot", config=vars(args), tags=[args.tag])
+    else:
+        wandb_exp = None
+
+    if not os.path.exists(args.log_path):
+        print(f"Path {args.log_path} did not exist. We create it.")
+        os.makedirs(args.log_path)
+
+    logger = UniversalLogger(wandb=wandb_exp,
+                             stdout=False,
+                             json=args.log_path, throttle=None, max_fig_save=2)
+    logger.log_metrics(0, {"log_path": args.log_path})
     
     if args.dataset == 'voc':
         train_dataset = PascalVOC(root=args.data_path, split='trainaug', image_size=args.image_size, mask_size = args.image_size)
@@ -240,17 +262,16 @@ def train(args):
                 if batch % log_interval == 0:
                     print('Train Epoch: {:3} [{:5}/{:5}] \t lr = {:5} \t MSE: {:F} \t TotNorm: {:F}'.format(
                           epoch+1, batch, train_epoch_size, lr_value, mse.item(), total_norm))
-    
-                    writer.add_scalar('TRAIN/mse', mse.item(), global_step)
-                    writer.add_scalar('TRAIN/lr_main', lr_value, global_step)
-                    writer.add_scalar('TRAIN/total_norm', total_norm, global_step)
+                    logger.log_metrics(global_step, {'TRAIN/mse': mse.item(),
+                                                     'TRAIN/lr_main': lr_value,
+                                                     'TRAIN/total_norm': total_norm})
 
         with torch.no_grad():
             model.eval()
 
             val_mse = 0.
             counter = 0
-    
+
             for batch, (image, true_mask_i, true_mask_c, mask_ignore) in enumerate(tqdm(val_loader)):
                 image = image.cuda()
                 true_mask_i = true_mask_i.cuda()
@@ -302,15 +323,15 @@ def train(args):
             mbo_i_slot = 100 * MBO_i_slot_metric.compute()
             miou_slot = 100 * miou_slot_metric.compute()
             val_loss = val_mse
-            writer.add_scalar('VAL/mse', val_mse, epoch+1)
-            writer.add_scalar('VAL/ari (slots)', ari_slot, epoch+1)
-            writer.add_scalar('VAL/ari (decoder)', ari, epoch+1)
-            writer.add_scalar('VAL/mbo_c', mbo_c, epoch+1)
-            writer.add_scalar('VAL/mbo_i', mbo_i, epoch+1)
-            writer.add_scalar('VAL/miou', miou, epoch+1)
-            writer.add_scalar('VAL/mbo_c (slots)', mbo_c_slot, epoch+1)
-            writer.add_scalar('VAL/mbo_i (slots)', mbo_i_slot, epoch+1)
-            writer.add_scalar('VAL/miou (slots)', miou_slot, epoch+1)
+            logger.log_metrics(global_step, {'VAL/mse': val_mse,
+                                             'VAL/ari (slots)': ari_slot.item(),
+                                             'VAL/ari (decoder)': ari.item(),
+                                             'VAL/mbo_c': mbo_c.item(),
+                                             'VAL/mbo_i': mbo_i.item(),
+                                             'VAL/miou': miou.item(),
+                                             'VAL/mbo_c (slots)': mbo_c_slot.item(),
+                                             'VAL/mbo_i (slots)': mbo_i_slot.item(),
+                                             'VAL/miou (slots)': miou_slot.item()})
             
             print(args.log_path)
             print('====> Epoch: {:3} \t Loss = {:F} \t MSE = {:F} \t ARI = {:F} \t ARI_slots = {:F} \t mBO_c = {:F} \t mBO_i = {:F} \t miou = {:F} \t mBO_c_slots = {:F} \t mBO_i_slots = {:F} \t miou_slots = {:F}'.format(
@@ -337,8 +358,8 @@ def train(args):
                 best_miou_slot = miou_slot
                 best_epoch = epoch + 1
     
-                torch.save(model.state_dict(), os.path.join(log_dir, 'best_model.pt'))
-                
+                torch.save(model.state_dict(), os.path.join(args.log_path, 'best_model.pt'))
+
             if epoch%visualize_per_epoch==0 or epoch==args.epochs-1:
                 image = inv_normalize(image)
                 image = F.interpolate(image, size=args.val_mask_size, mode='bilinear')
@@ -348,9 +369,9 @@ def train(args):
                 vis_recon = visualize(image, true_mask_c, pred_dec_mask, rgb_dec_attns, pred_default_mask, rgb_default_attns, N=32)
                 grid = vutils.make_grid(vis_recon, nrow=2*args.num_slots + 4, pad_value=0.2)[:, 2:-2, 2:-2]
                 grid = F.interpolate(grid.unsqueeze(1), scale_factor=0.15, mode='bilinear').squeeze() # Lower resolution
-                writer.add_image('VAL_recon/epoch={:03}'.format(epoch + 1), grid)
-    
-            writer.add_scalar('VAL/best_loss', best_val_loss, epoch+1)
+                logger.log_figure('VAL_recon', grid2fig(grid), step=global_step)
+
+            logger.log_metrics(global_step, {'VAL/best_loss': best_val_loss})
     
             checkpoint = {
                 'epoch': epoch + 1,
@@ -368,11 +389,17 @@ def train(args):
                 'optimizer': optimizer.state_dict()
             }
     
-            torch.save(checkpoint, os.path.join(log_dir, 'checkpoint.pt.tar'))
+            torch.save(checkpoint, os.path.join(args.log_path, 'checkpoint.pt.tar'))
     
             print('====> Best Loss = {:F} @ Epoch {}'.format(best_val_loss, best_epoch))
     
-    writer.close()
+    #writer.close()
+
+def grid2fig(grid):
+    fig, ax = plt.subplots(dpi=300)
+    ax.imshow(np.moveaxis(grid.cpu().numpy(), 0, -1))
+    ax.axis('off')
+    return fig
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('SPOT', parents=[get_args_parser()])
