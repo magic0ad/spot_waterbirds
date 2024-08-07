@@ -87,10 +87,16 @@ def get_args_parser():
     parser.add_argument('--train_permutations',  type=str, default='random', help='which permutation')
     parser.add_argument('--eval_permutations',  type=str, default='standard', help='which permutation')
 
-    parser.add_argument('--reg_type', type=str, default='none', choices=['constraint', 'penalty', 'none'], help="Regulariization to promote partition-like attention masks in SlotAttention encoder")
+    parser.add_argument('--reg_type', type=str, default='none', choices=['constraint', 'constraint_identity', 'penalty', 'penalty_identity', 'none'], help="Regulariization to promote partition-like attention masks in SlotAttention encoder")
     parser.add_argument('--dual_restart', type=bool_flag, default=True, help='whether to use dual restart in constrained optim')
     parser.add_argument('--lr_dual', type=float, default=1e-5)
     parser.add_argument('--epochs_before_constraint', type=int, default=0, help='Number of epochs before training')
+    parser.add_argument('--epochs_before_slot_temp', type=int, default=10000,
+                        help='whether to use the temperature schedule for slot attention')
+    parser.add_argument('--sa_variant', type=bool_flag, default=False,
+                        help='whether to use my ReLU variant of the slotAttention architecure. Should use with regularization or constraint.')
+    parser.add_argument('--start_penalty', type=float, default=1e-5)
+    parser.add_argument('--final_penalty', type=float, default=1e-5)
 
     # wandb
     #parser.add_argument('--wandb_project_name', type=str, default=None, help='Name of the wandb project')
@@ -227,36 +233,51 @@ def train(args):
                                     warmup_epochs=int(args.lr_warmup_steps/(len(train_dataset)/args.batch_size)),
                                     start_warmup_value=0)
     def dual_lr_schedule(current_epoch):
-        if current_epoch < args.epochs_before_constraint:
+        if current_epoch < args.epochs_before_constraint or args.reg_type not in ["constraint", "constraint_identity"]:
             return 0.
         else:
             return args.lr_dual
 
+    def slot_temp_schedule(current_epoch):
+        if current_epoch < args.epochs_before_slot_temp:
+            return 1.
+        else:
+            return 1e-4
+
+    def penalty_schedule(current_iter):
+        if args.reg_type in ["penalty", "penalty_identity"]:
+            # linear interpolation in log-space
+            total_iter = args.epochs * train_epoch_size
+            return args.start_penalty**((total_iter - current_iter) / total_iter) * args.final_penalty**(current_iter / total_iter)
+        else:
+            return 0.
+
     # constrained optimization with cooper
-    is_constrained = (args.reg_type == "constraint")
     cmp = CustomCMP(reg_type=args.reg_type)
     formulation = cooper.LagrangianFormulation(cmp)
     primal_optimizer = Adam([
         {'params': (param for name, param in model.named_parameters() if param.requires_grad), 'lr': args.lr_main},
     ])
-    if is_constrained:
+    if cmp.is_constrained:
         dual_optimizer = cooper.optim.partial_optimizer(torch.optim.SGD,lr=args.lr_dual)
     else:
         dual_optimizer = None
     constrained_optimizer = cooper.ConstrainedOptimizer(formulation, primal_optimizer, dual_optimizer,
                                                         dual_restarts=args.dual_restart)
-    # cooper hacks
-    # 1) initialize the multiplier now (instead of during the first .step() call) for checkpointing
-    image = next(iter(train_loader))
-    formulation.create_state(cmp.closure(model, image.cuda(), args))
-    # 2) initialize dual_optimizer now (instead of during the first .step() call) for scheduling
-    constrained_optimizer.dual_optimizer = constrained_optimizer.dual_optimizer(formulation.dual_parameters)
-    dual_optimizer = constrained_optimizer.dual_optimizer
+    if cmp.is_constrained:
+        # cooper hacks
+        # 1) initialize the multiplier now (instead of during the first .step() call) for checkpointing
+        image = next(iter(train_loader))
+        formulation.create_state(cmp.closure(model, image.cuda(), args))
+        # 2) initialize dual_optimizer now (instead of during the first .step() call) for scheduling
+        constrained_optimizer.dual_optimizer = constrained_optimizer.dual_optimizer(formulation.dual_parameters)
+        dual_optimizer = constrained_optimizer.dual_optimizer
+        # make sure the dual parameter is initialized to zero
+        assert (formulation.eq_multipliers.forward() == 0.).all()
 
     if checkpoint is not None:
         primal_optimizer.load_state_dict(checkpoint['primal_optimizer'])
-        if is_constrained:
-            # note: no need to load learning rate, since it can be inferred from `epoch`
+        if cmp.is_constrained:
             formulation.eq_multipliers.load_state_dict(checkpoint["eq_multipliers"])
     
     MBO_c_metric = UnsupervisedMaskIoUMetric(matching="best_overlap", ignore_background = True, ignore_overlaps = True).cuda()
@@ -269,8 +290,9 @@ def train(args):
     miou_slot_metric = UnsupervisedMaskIoUMetric(matching="hungarian", ignore_background = True, ignore_overlaps = True).cuda()
     ari_slot_metric = ARIMetric(foreground = True, ignore_overlaps = True).cuda()
     
-    visualize_per_epoch = int(args.epochs*args.eval_viz_percent)
-    
+    #visualize_per_epoch = int(args.epochs*args.eval_viz_percent)
+    visualize_per_epoch = 2  # to vis every 2 epochs
+
     for epoch in range(start_epoch, args.epochs):
     
         model.train()
@@ -284,36 +306,51 @@ def train(args):
             # learning rate schedules
             primal_optimizer.param_groups[0]['lr'] = lr_schedule[global_step]
             lr_value = primal_optimizer.param_groups[0]['lr']
-            if is_constrained:
+            if cmp.is_constrained:
                 dual_optimizer.param_groups[0]['lr'] = dual_lr_schedule(epoch)
+            slot_temp = slot_temp_schedule(epoch)
+            penalty_coeff = penalty_schedule(global_step)
             
             constrained_optimizer.zero_grad()
-            lagrangian = formulation.composite_objective(cmp.closure, model, image, args)
+            lagrangian = formulation.composite_objective(cmp.closure, model, image, args, slot_temp, penalty_coeff)
             formulation.custom_backward(lagrangian)
 
             total_norm = clip_grad_norm_(model.parameters(), args.clip, 'inf')
             total_norm = total_norm.item()
             constrained_optimizer.step()
 
-            mse = cmp.state.loss
-            defect = cmp.state.eq_defect
-            num_constraints = (defect.shape[0] ** 2 - defect.shape[0])
-            defect = defect.sum() / num_constraints  #constraint violation, the diagonal is zero, so exclude from denominator when averaging
-            if formulation.eq_multipliers is not None:
+            loss = cmp.state.loss.item()
+            mse = cmp.state.misc['mse'].item()
+            penalty = cmp.state.misc['penalty'].item()
+            num_constraints = cmp.state.misc['num_constraints']
+            defects_log = {f"defect_{i}": cmp.state.misc['defects_list'][i].item() for i in range(args.num_iterations)}
+            entropies_log = {f"entropy_{i}": cmp.state.misc["entropies_list"][i].item() for i in range(args.num_iterations)}
+
+            if cmp.is_constrained:
                 multiplier = formulation.eq_multipliers.forward().sum().item() / num_constraints
             else:
                 multiplier = 0.
             
             with torch.no_grad():
                 if batch % log_interval == 0:
-                    print('Train Epoch: {:3} [{:5}/{:5}] \t lr = {:5} \t MSE: {:F} \t Defects\' mean: {:F} \t Multipliers\' mean: {:F} \t TotNorm: {:F}'.format(
-                          epoch+1, batch, train_epoch_size, lr_value, mse.item(), defect.item(), multiplier, total_norm))
-                    logger.log_metrics(global_step, {'TRAIN/mse': mse.item(),
-                                                     'TRAIN/lr_main': lr_value,
-                                                     'TRAIN/total_norm': total_norm,
-                                                     'TRAIN/defect': defect.item(),
-                                                     'TRAIN/multiplier': multiplier,
-                                                     'epoch': epoch})
+                    print('Train Epoch: {:3} [{:5}/{:5}] \t lr = {:5} \t Loss: {:F} \t MSE: {:F} \t Penalty: {:F} \t Penalty coeff: {:F} \t Multipliers\' mean: {:F} \t TotNorm: {:F}'.format(
+                          epoch+1, batch, train_epoch_size, lr_value, loss, mse, penalty, penalty_coeff, multiplier, total_norm))
+                    log_dict = {'TRAIN/loss': loss,
+                                 'TRAIN/mse': mse,
+                                 'TRAIN/lr_main': lr_value,
+                                 'TRAIN/total_norm': total_norm,
+                                 'TRAIN/penalty': penalty,
+                                 'TRAIN/multiplier': multiplier,
+                                 'TRAIN/slot_temp': slot_temp,
+                                 'TRAIN/penalty_coeff': penalty_coeff,
+                                 'epoch': epoch}
+                    log_dict.update(defects_log)  # in-place operation
+                    log_dict.update(entropies_log)  # in-place operation
+                    logger.log_metrics(global_step, log_dict)
+
+            #if batch > 5:
+            #    print("HAAACCKK")
+            #    break
 
         with torch.no_grad():
             model.eval()
@@ -330,7 +367,7 @@ def train(args):
                 batch_size = image.shape[0]
                 counter += batch_size
     
-                mse, default_slots_attns, dec_slots_attns, _, _, _ = model(image)
+                mse, default_slots_attns, dec_slots_attns, _, _, _, _ = model(image, slot_temp)
     
                 # DINOSAUR uses as attention masks the attenton maps of the decoder
                 # over the slots, which bilinearly resizes to match the image resolution
@@ -436,7 +473,7 @@ def train(args):
                 'best_epoch': best_epoch,
                 'model': model.state_dict(),
                 'primal_optimizer': primal_optimizer.state_dict()}
-            if is_constrained:
+            if cmp.is_constrained:
                 checkpoint['eq_multipliers'] = formulation.eq_multipliers.state_dict()
     
             torch.save(checkpoint, os.path.join(args.log_path, 'checkpoint.pt.tar'))

@@ -15,6 +15,7 @@ class SlotAttention(nn.Module):
         mlp_size, 
         truncate,
         heads,
+        sa_variant=False,
         epsilon=1e-8, 
         drop_path=0,
     ):
@@ -25,6 +26,7 @@ class SlotAttention(nn.Module):
         self.epsilon = epsilon
         self.truncate = truncate
         self.num_heads = heads
+        self.sa_variant = sa_variant
 
         self.norm_inputs = nn.LayerNorm(input_size)
         self.norm_slots = nn.LayerNorm(slot_size)
@@ -47,7 +49,7 @@ class SlotAttention(nn.Module):
         assert self.truncate in ['bi-level', 'fixed-point', 'none']
 
 
-    def forward(self, inputs, slots_init):
+    def forward(self, inputs, slots_init, temperature=1):
         # `inputs` has shape [batch_size, num_inputs, input_size].
         # `slots` has shape [batch_size, num_slots, slot_size].
         slots = slots_init
@@ -60,6 +62,7 @@ class SlotAttention(nn.Module):
         k = ((self.slot_size // self.num_heads) ** (-0.5)) * k
         
         # Multiple rounds of attention.
+        attn_list = []
         for i in range(self.num_iter):
             if i == self.num_iter  - 1:
                 if self.truncate == 'bi-level':
@@ -71,15 +74,23 @@ class SlotAttention(nn.Module):
             
             # Attention.
             q = self.project_q(slots).view(B, N_q, self.num_heads, -1).transpose(1, 2)  # Shape: [batch_size, num_heads, num_slots, slot_size // num_heads].
-            attn_logits = torch.matmul(k, q.transpose(-1, -2))                          # Shape: [batch_size, num_heads, num_inputs, num_slots].
-            attn = F.softmax(
-                attn_logits.transpose(1, 2).reshape(B, N_kv, self.num_heads * N_q)
-            , dim=-1).view(B, N_kv, self.num_heads, N_q).transpose(1, 2)                # Shape: [batch_size, num_heads, num_inputs, num_slots].
-            attn_vis = attn.sum(1)                                                      # Shape: [batch_size, num_inputs, num_slots].
-            
-            # Weighted mean.
-            attn = attn + self.epsilon
-            attn = attn / torch.sum(attn, dim=-2, keepdim=True)
+            attn_logits = torch.matmul(k, q.transpose(-1, -2)) / temperature            # Shape: [batch_size, num_heads, num_inputs, num_slots].
+            if not self.sa_variant:
+                attn = F.softmax(
+                    attn_logits.transpose(1, 2).reshape(B, N_kv, self.num_heads * N_q)
+                , dim=-1).view(B, N_kv, self.num_heads, N_q).transpose(1, 2)                # Shape: [batch_size, num_heads, num_inputs, num_slots].
+                attn_vis = attn.sum(1)                                                      # Shape: [batch_size, num_inputs, num_slots].
+                attn_list.append(attn_vis.transpose(1,2))
+
+                # Weighted mean.
+                attn = attn + self.epsilon
+                attn = attn / torch.sum(attn, dim=-2, keepdim=True)
+            else:
+                attn = torch.sigmoid(
+                    attn_logits.transpose(1, 2).reshape(B, N_kv, self.num_heads * N_q)).view(B, N_kv, self.num_heads, N_q).transpose(1,2)  # Shape: [batch_size, num_heads, num_inputs, num_slots].
+                attn_vis = attn.sum(1)
+                attn_list.append(attn_vis.transpose(1,2))
+
             updates = torch.matmul(attn.transpose(-1, -2), v)                           # Shape: [batch_size, num_heads, num_slots, slot_size // num_heads].
             updates = updates.transpose(1, 2).reshape(B, N_q, -1)                       # Shape: [batch_size, num_slots, slot_size].
             
@@ -89,12 +100,12 @@ class SlotAttention(nn.Module):
             slots = slots.view(-1, N_q, self.slot_size)
             slots = slots + self.mlp(self.norm_mlp(slots))
         
-        return slots, attn_vis, attn_logits
+        return slots, attn_vis, attn_logits, attn_list
 
 class SlotAttentionEncoder(nn.Module):
     
     def __init__(self, num_iterations, num_slots,
-                 input_channels, slot_size, mlp_hidden_size, pos_channels, truncate='bi-level', init_method='embedding', num_heads = 1, drop_path = 0.0):
+                 input_channels, slot_size, mlp_hidden_size, pos_channels, truncate='bi-level', init_method='embedding', sa_variant = False, num_heads = 1, drop_path = 0.0):
         super().__init__()
         
         self.num_iterations = num_iterations
@@ -104,6 +115,7 @@ class SlotAttentionEncoder(nn.Module):
         self.mlp_hidden_size = mlp_hidden_size
         self.pos_channels = pos_channels
         self.init_method = init_method
+        self.sa_variant = sa_variant
 
         self.layer_norm = nn.LayerNorm(input_channels)
         self.mlp = nn.Sequential(
@@ -126,9 +138,9 @@ class SlotAttentionEncoder(nn.Module):
         
         self.slot_attention = SlotAttention(
             num_iterations,
-            input_channels, slot_size, mlp_hidden_size, truncate, num_heads, drop_path=drop_path)
+            input_channels, slot_size, mlp_hidden_size, truncate, num_heads, sa_variant, drop_path=drop_path)
     
-    def forward(self, x):
+    def forward(self, x, temperature=1):
         # `image` has shape: [batch_size, img_channels, img_height, img_width].
         # `encoder_grid` has shape: [batch_size, pos_channels, enc_height, enc_width].
         B, *_ = x.size()
@@ -140,11 +152,11 @@ class SlotAttentionEncoder(nn.Module):
         # Slot Attention module.
         init_slots = self.slots_initialization(B, dtype, device)
 
-        slots, attn, attn_logits = self.slot_attention(x, init_slots)
+        slots, attn, attn_logits, attn_list = self.slot_attention(x, init_slots, temperature)
         # `slots` has shape: [batch_size, num_slots, slot_size].
         # `attn` has shape: [batch_size, enc_height * enc_width, num_slots].
         
-        return slots, attn, init_slots, attn_logits
+        return slots, attn, init_slots, attn_logits, attn_list
     
     def slots_initialization(self, B, dtype, device):
         # The first frame, initialize slots.

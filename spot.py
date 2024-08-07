@@ -45,7 +45,7 @@ class SPOT(nn.Module):
         self.slot_attn = SlotAttentionEncoder(
             args.num_iterations, args.num_slots,
             args.d_model, args.slot_size, args.mlp_hidden_size, args.pos_channels,
-            args.truncate, args.init_method)
+            args.truncate, args.init_method, args.sa_variant)
 
         self.input_proj = nn.Sequential(
             linear(args.d_model, args.d_model, bias=False),
@@ -244,7 +244,7 @@ class SPOT(nn.Module):
 
         return mean_dec_output, mean_dec_slots_attns
 
-    def get_embeddings_n_slots(self, image):
+    def get_embeddings_n_slots(self, image, temperature=1.):
         """
         image: batch_size x img_channels x H x W
         """
@@ -255,10 +255,10 @@ class SPOT(nn.Module):
         # emb_target shape: B, N, D
 
         # Apply the slot attention
-        slots, slots_attns, _ = self.slot_attn(emb_target)
+        slots, slots_attns, _, _ = self.slot_attn(emb_target, temperature)
         return emb_target, slots, slots_attns
 
-    def forward(self, image):
+    def forward(self, image, temperature=1.):
         """
         image: batch_size x img_channels x H x W
         """
@@ -273,7 +273,7 @@ class SPOT(nn.Module):
         # emb_target shape: B, N, D
 
         # Apply the slot attention
-        slots, slots_attns, init_slots, attn_logits = self.slot_attn(emb_input)
+        slots, slots_attns, init_slots, attn_logits, slot_attn_list = self.slot_attn(emb_input, temperature)
         attn_logits = attn_logits.squeeze()
         # slots shape: [B, num_slots, Ds]
         # slots_attns shape: [B, N, num_slots]
@@ -289,4 +289,4 @@ class SPOT(nn.Module):
         slots_attns = slots_attns.transpose(-1, -2).reshape(B, self.num_slots, H_enc, W_enc)
         dec_slots_attns = dec_slots_attns.transpose(-1, -2).reshape(B, self.num_slots, H_enc, W_enc)
 
-        return loss_mse, slots_attns, dec_slots_attns, slots, dec_recon, attn_logits
+        return loss_mse, slots_attns, dec_slots_attns, slots, dec_recon, attn_logits, slot_attn_list
